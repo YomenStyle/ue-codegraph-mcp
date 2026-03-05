@@ -1,5 +1,12 @@
 # Patch Notes
 
+## v1.0.6 (2026-03-05)
+- Feature: `--headers-only` 옵션 추가 (엔진 소스 인덱싱 용량 절감용)
+  - CLI: `ue-graph index <path> [name] --headers-only`
+  - MCP: `init_codebase` 툴에 `headers_only` 파라미터 추가
+  - `.h` / `.hpp` / `.inl` 만 인덱싱, `.cpp` / `.cc` / `.cxx` 제외
+  - 클래스 계층·메서드 시그니처·UE 매크로 분석은 정상 동작, 엔진 내부 호출 그래프는 미지원
+
 ## v1.0.5 (2026-03-05)
 - Fix: `virtual` 키워드가 있는 포인터/참조 반환 메서드가 인덱싱에서 누락되는 버그 수정
   - 예: `virtual UObject* GetObject() override;`, `virtual AActor& GetActor() override;`

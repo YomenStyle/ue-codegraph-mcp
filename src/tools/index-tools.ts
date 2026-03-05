@@ -13,8 +13,9 @@ export function registerIndexTools(server: McpServer): void {
       path: z.string().describe('Absolute path to UE Engine source or project root'),
       name: z.string().optional().describe('Name for this codebase (defaults to directory name)'),
       type: z.enum(['engine', 'project']).optional().describe('Codebase type (auto-detected if not specified)'),
+      headers_only: z.boolean().optional().default(false).describe('Only index header files (.h/.hpp/.inl), skip .cpp files. Recommended for large engine source to reduce index size.'),
     },
-    async ({ path: rootPath, name, type }) => {
+    async ({ path: rootPath, name, type, headers_only }) => {
       try {
         // Auto-detect type if not specified
         let codebaseType: 'engine' | 'project' = type || 'project';
@@ -28,7 +29,7 @@ export function registerIndexTools(server: McpServer): void {
 
         const codebaseName = name || rootPath.split('/').pop() || 'unnamed';
 
-        const result = await indexCodebase(rootPath, codebaseName, codebaseType);
+        const result = await indexCodebase(rootPath, codebaseName, codebaseType, headers_only ?? false);
 
         return {
           content: [{

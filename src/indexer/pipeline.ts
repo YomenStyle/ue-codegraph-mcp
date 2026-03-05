@@ -26,7 +26,7 @@ export interface IndexResult {
   elapsedMs: number;
 }
 
-export async function indexCodebase(rootPath: string, name: string, type: 'engine' | 'project'): Promise<IndexResult> {
+export async function indexCodebase(rootPath: string, name: string, type: 'engine' | 'project', headersOnly = false): Promise<IndexResult> {
   const startTime = Date.now();
   const db = getDb();
   const queries = getQueries();
@@ -41,7 +41,8 @@ export async function indexCodebase(rootPath: string, name: string, type: 'engin
   const codebaseId = codebase.id;
 
   // Discover files
-  const discoveredFiles = discoverFiles(rootPath);
+  if (headersOnly) logger.info('Headers-only mode: skipping .cpp/.cc/.cxx files');
+  const discoveredFiles = discoverFiles(rootPath, headersOnly);
 
   // Detect changes (incremental)
   const changes = detectChanges(codebaseId, discoveredFiles);

@@ -10,10 +10,12 @@ export interface DiscoveredFile {
   size: number;
 }
 
-export function discoverFiles(rootPath: string): DiscoveredFile[] {
+const HEADER_EXTENSIONS = new Set(['.h', '.hpp', '.inl']);
+
+export function discoverFiles(rootPath: string, headersOnly = false): DiscoveredFile[] {
   const config = getConfig();
   const results: DiscoveredFile[] = [];
-  const extensions = new Set(config.fileExtensions);
+  const extensions = headersOnly ? HEADER_EXTENSIONS : new Set(config.fileExtensions);
 
   function shouldExclude(filePath: string): boolean {
     const rel = path.relative(rootPath, filePath);

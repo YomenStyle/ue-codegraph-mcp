@@ -17,7 +17,7 @@ Usage:
   ue-graph <command> [arguments]
 
 Commands:
-  index <path> [name]           코드베이스 인덱싱
+  index <path> [name] [--headers-only]  코드베이스 인덱싱
   status                        인덱싱 상태 조회
   reindex <file_path>           단일 파일 재인덱싱
   delete <id|name|all>          코드베이스 삭제
@@ -61,11 +61,15 @@ async function main() {
     switch (command) {
       case 'index': {
         const path = args[1];
-        if (!path) { console.error('Error: path required\nUsage: ue-graph index <path> [name]'); process.exit(1); }
-        const name = args[2] || path.split('/').pop();
-        const type = args[3] === 'engine' ? 'engine' : 'project';
+        if (!path) { console.error('Error: path required\nUsage: ue-graph index <path> [name] [--headers-only]'); process.exit(1); }
+        const flags = args.filter(a => a.startsWith('--'));
+        const positional = args.filter(a => !a.startsWith('--'));
+        const name = positional[2] || path.split('/').pop();
+        const type = positional[3] === 'engine' ? 'engine' : 'project';
+        const headersOnly = flags.includes('--headers-only');
+        if (headersOnly) console.log('Mode: headers-only (.h/.hpp/.inl only, .cpp skipped)');
         console.log(`Indexing ${path} as "${name}" (${type})...`);
-        const result = await indexCodebase(path, name, type);
+        const result = await indexCodebase(path, name, type, headersOnly);
         console.log(`\nDone!`);
         console.log(`  Files: ${result.totalFiles} (new: ${result.newFiles}, changed: ${result.changedFiles})`);
         console.log(`  Symbols: ${result.totalSymbols}`);
