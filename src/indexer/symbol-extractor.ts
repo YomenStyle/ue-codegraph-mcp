@@ -240,6 +240,13 @@ function extractDeclaration(
       extractFunction(node, source, symbols, parentName, access, true);
       return;
     }
+    // Handle pointer/reference return types: e.g. virtual UObject* GetObject() override;
+    if (child.type === 'pointer_declarator' || child.type === 'reference_declarator') {
+      if (findDeepChild(child, 'function_declarator')) {
+        extractFunction(node, source, symbols, parentName, access, true);
+        return;
+      }
+    }
     // Nested class/struct/enum
     if (child.type === 'class_specifier' || child.type === 'struct_specifier') {
       extractClassOrStruct(child, source, symbols, parentName);
@@ -251,10 +258,15 @@ function extractDeclaration(
     }
   }
 
-  // Check if it's a function declaration via init_declarator containing function_declarator
-  const declarators = node.children.filter(c => c.type === 'init_declarator' || c.type === 'function_declarator');
+  // Check if it's a function declaration via init_declarator / pointer / reference declarator containing function_declarator
+  const declarators = node.children.filter(c =>
+    c.type === 'init_declarator' ||
+    c.type === 'function_declarator' ||
+    c.type === 'pointer_declarator' ||
+    c.type === 'reference_declarator'
+  );
   for (const decl of declarators) {
-    const funcDecl = decl.type === 'function_declarator' ? decl : findChild(decl, 'function_declarator');
+    const funcDecl = decl.type === 'function_declarator' ? decl : findDeepChild(decl, 'function_declarator');
     if (funcDecl) {
       extractFunction(node, source, symbols, parentName, access, true);
       return;
