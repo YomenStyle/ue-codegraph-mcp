@@ -8,7 +8,7 @@ let _parser: Parser | null = null;
 function getParser(): Parser {
   if (!_parser) {
     _parser = new Parser();
-    _parser.setLanguage(Cpp as unknown as Parser.Language);
+    _parser.setLanguage(Cpp as unknown as Parameters<Parser['setLanguage']>[0]);
   }
   return _parser;
 }
