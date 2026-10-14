@@ -750,5 +750,86 @@ async function pollVersion(silent) {
 }
 boot().catch((e) => { $('overview').hidden = false; $('overview').replaceChildren(el('div', { class: 'box' }, 'Failed to load: ' + e.message)); });
 </script>
+<script>
+/* ------------------------------------------------------------------ 한글 UI (표시 문구만 치환, 로직 무관) */
+(() => {
+  const D = {
+    'live': '연결됨', 'offline': '연결 끊김',
+    'Overview': '개요', 'Class hierarchy': '클래스 상속', 'Call graph': '호출 그래프', 'Includes': 'include 관계', 'Modules': '모듈(폴더)',
+    'Codebase': '코드베이스', 'Direction': '방향', 'both': '양쪽', 'up': '위쪽 (부모/호출자)', 'down': '아래쪽 (자식/피호출자)',
+    'Depth': '탐색 깊이', 'Folder depth': '폴더 깊이', 'auto': '자동', 'Min includes': '최소 include 수',
+    '← Back': '← 뒤로', 'Fit': '화면 맞춤',
+    'Search…': '검색…', 'Search': '검색', 'Toggle light / dark': '밝게 / 어둡게 전환', 'Toggle theme': '테마 전환',
+    'Zoom in': '확대', 'Zoom out': '축소', 'Codebase ': '코드베이스',
+    'Search a class. Double-click a node to re-center on it.': '클래스를 검색하세요. 노드를 더블클릭하면 그 노드가 중심이 됩니다.',
+    'Search a function. Arrows point caller → callee.': '함수를 검색하세요. 화살표는 호출하는 쪽 → 호출되는 쪽입니다.',
+    'Search a file. Arrows point includer → included header.': '파일을 검색하세요. 화살표는 include 하는 파일 → include 되는 헤더입니다.',
+    'Folder-level #include dependencies. Node size ≈ symbols.': '폴더 단위 #include 의존성. 화살표: include 하는 폴더 → include 되는 폴더. 노드 크기 ≈ 심볼 수.',
+    'Class name, e.g. AActor': '클래스 이름 (예: AActor)', 'Function name, e.g. BeginPlay': '함수 이름 (예: BeginPlay)', 'File name, e.g. Actor.h': '파일 이름 (예: Actor.h)',
+    'Search for a class to see its inheritance hierarchy.': '클래스를 검색하면 상속 구조를 볼 수 있습니다.',
+    'Search for a function to see who calls it and what it calls.': '함수를 검색하면 호출하는 곳과 호출되는 곳을 볼 수 있습니다.',
+    'Search for a source file to see its #include neighbourhood.': '소스 파일을 검색하면 #include 관계를 볼 수 있습니다.',
+    'Nothing to show. Try a different name or a lower "Min includes".': '표시할 내용이 없습니다. 다른 이름을 입력하거나 "최소 include 수"를 낮춰 보세요.',
+    'Index updated — refreshing': '인덱스가 갱신되어 새로고침합니다', 'Path copied': '경로를 복사했습니다',
+    'Index overview': '인덱스 개요', 'Click an entry to jump to its graph.': '항목을 클릭하면 해당 그래프로 이동합니다.',
+    'Details': '상세 정보', 'Legend': '범례',
+    'Click a node for details. Double-click to re-center, drag to move, scroll to zoom.': '노드를 클릭하면 상세 정보, 더블클릭하면 중심 이동, 드래그로 이동, 스크롤로 확대/축소합니다.',
+    'not indexed': '인덱싱 안 됨', 'folder': '폴더', 'file (colour = folder)': '파일 (색 = 폴더)', 'UE macro': 'UE 매크로', 'Blueprint-exposed': '블루프린트 노출',
+    'Drill down': '하위 폴더로 들어가기',
+    'Referenced but not part of the indexed source (engine or external code).': '참조되지만 인덱싱된 소스에는 없습니다 (엔진 또는 외부 코드).',
+    'Signature': '시그니처', 'Parameters': '매개변수', 'Calls': '호출', 'Member of': '소속 클래스', 'Base classes': '부모 클래스',
+    'Symbols': '심볼', 'Copy path': '경로 복사', 'Include graph': 'include 그래프', 'system': '시스템',
+    'Files': '파일', 'Classes & structs': '클래스·구조체', 'Functions & methods': '함수·메서드', 'UE macros': 'UE 매크로',
+    'Link quality': '연결 품질', 'Calls resolved to a symbol': '심볼로 연결된 호출', 'Includes resolved to a file': '파일로 연결된 include',
+    'Base classes resolved': '연결된 부모 클래스',
+    'Unresolved calls usually target engine code that is not indexed': '연결되지 않은 호출은 대부분 인덱싱되지 않은 엔진 코드를 가리킵니다',
+    'Engine / third-party headers are not indexed, so a share of includes always stays unresolved (*.generated.h excluded)': '엔진·외부 헤더는 인덱싱되지 않아 일부 include는 항상 연결되지 않습니다 (*.generated.h 제외)',
+    'Unresolved bases are typically engine classes (AActor, UObject…)': '연결되지 않은 부모 클래스는 대개 엔진 클래스입니다 (AActor, UObject…)',
+    'Symbols by kind': '종류별 심볼', 'No UE macros found.': 'UE 매크로가 없습니다.',
+    'Folders by symbol count (click → dependencies)': '폴더별 심볼 수 (클릭 → 의존성)',
+    'Largest classes (members)': '멤버가 많은 클래스', 'Most called functions': '가장 많이 호출된 함수', 'Most included headers': '가장 많이 include 된 헤더',
+    'Nothing indexed yet': '아직 인덱싱된 것이 없습니다', 'Index a project first:': '먼저 프로젝트를 인덱싱하세요:',
+    // 심볼 종류 / 매크로 종류
+    'class': '클래스', 'struct': '구조체', 'interface': '인터페이스', 'function': '함수', 'method': '메서드', 'constructor': '생성자',
+    'destructor': '소멸자', 'field': '필드', 'variable': '변수', 'enum': '열거형', 'typedef': '타입 별칭', 'namespace': '네임스페이스', 'file': '파일',
+  };
+  const P = [
+    [/^(\d[\d,]*) nodes · (\d[\d,]*) edges(.*)$/, (m) => `노드 ${m[1]}개 · 연결 ${m[2]}개` + m[3]
+      .replace(' · folder depth ', ' · 폴더 깊이 ').replace(' · truncated — reduce depth', ' · 일부 생략됨 — 깊이를 줄이세요')],
+    [/^(.+) is not indexed$/, (m) => `${m[1]} 은(는) 인덱싱되지 않았습니다`],
+    [/^(\d[\d,]*) caller\(s\) · (\d[\d,]*) callee\(s\)$/, (m) => `호출하는 곳 ${m[1]}개 · 호출되는 곳 ${m[2]}개`],
+    [/^(\d[\d,]*) file\(s\) include this · (\d[\d,]*) #include\(s\)$/, (m) => `이 파일을 include 하는 파일 ${m[1]}개 · 이 파일의 #include ${m[2]}개`],
+    [/^Derived \((.+)\)$/, (m) => `파생 클래스 (${m[1]})`],
+    [/^Methods \((.+)\)$/, (m) => `메서드 (${m[1]})`],
+    [/^Fields \((.+)\)$/, (m) => `필드 (${m[1]})`],
+    [/^([\d,]+) of ([\d,]+)$/, (m) => `${m[2]} 중 ${m[1]}`],
+    [/^Error: (.*)$/, (m) => `오류: ${m[1]}`],
+    [/^Failed to load: (.*)$/, (m) => `불러오기 실패: ${m[1]}`],
+    [/^(.+) \((\d[\d,]*) symbols\)$/, (m) => `${m[1]} (심볼 ${m[2]}개)`],
+  ];
+  const tr = (s) => {
+    const t = s.trim(); if (!t) return s;
+    let out = D[t];
+    if (out === undefined) for (const [re, f] of P) { const m = t.match(re); if (m) { out = f(m); break; } }
+    return out === undefined ? s : s.replace(t, out);
+  };
+  const ATTRS = ['placeholder', 'title', 'aria-label'];
+  const walk = (root) => {
+    if (root.nodeType === 3) { const v = tr(root.nodeValue); if (v !== root.nodeValue) root.nodeValue = v; return; }
+    if (root.nodeType !== 1 || /^(SCRIPT|STYLE|CODE|PRE|CANVAS)$/.test(root.tagName)) return;
+    for (const a of ATTRS) if (root.hasAttribute(a)) { const v = tr(root.getAttribute(a)); if (v !== root.getAttribute(a)) root.setAttribute(a, v); }
+    for (const c of root.childNodes) walk(c);
+  };
+  document.documentElement.lang = 'ko';
+  walk(document.body);
+  new MutationObserver((muts) => {
+    for (const m of muts) {
+      if (m.type === 'attributes') walk(m.target);
+      else if (m.type === 'characterData') walk(m.target);
+      else m.addedNodes.forEach(walk);
+    }
+  }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ATTRS });
+})();
+</script>
 </body>
 </html>
