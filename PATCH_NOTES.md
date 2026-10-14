@@ -1,5 +1,17 @@
 # Patch Notes
 
+## Unreleased
+- Feature: 코드베이스 범위 지정 (`include_dirs` / `exclude`) - 한 코드베이스로 여러 폴더(예: `Source` + `Plugins`)를 묶어서 인덱싱
+  - 경로는 항상 루트 기준 상대경로라서 Source <-> Plugins 사이의 include / 호출 / 상속 링크가 한 그래프에서 연결됨
+  - CLI: `ue-graph index <root> <name> --include=Source,Plugins --exclude=**/Tests/**`
+  - MCP: `init_codebase` 툴에 `include_dirs`, `exclude` 파라미터 추가 (생략하면 저장된 설정 유지, `[]`는 초기화)
+  - 설정은 DB(`codebases.include_dirs`, `exclude_patterns`, 스키마 v3)에 저장되어 watcher / 재시작 후 catch-up에도 동일하게 적용
+  - 범위를 좁히면 범위 밖이 된 파일은 인덱스에서 제거됨
+- Fix: 경로가 겹치는 코드베이스(예: 프로젝트 전체 + `Source`만)에서 파일 조회가 다른 코드베이스의 행을 잡아 덮어쓰던 문제 수정
+  - 파일 조회를 코드베이스 단위로 한정하고, `reindex_file` / watcher는 해당 파일을 가진 모든 코드베이스를 갱신
+- Viewer: 화면 한글화 (표시 문구만 치환하는 레이어, 로직 변경 없음)
+- Test: `test/scope.test.mjs` 추가
+
 ## v1.0.6 (2026-03-05)
 - Feature: `--headers-only` 옵션 추가 (엔진 소스 인덱싱 용량 절감용)
   - CLI: `ue-graph index <path> [name] --headers-only`

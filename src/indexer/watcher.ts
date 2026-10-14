@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { getConfig } from '../config.js';
 import { getQueries } from '../db/queries.js';
-import { isIndexablePath } from './file-discovery.js';
+import { isIndexablePath, scopeFromRow, CodebaseScope } from './file-discovery.js';
 import { indexCodebase, reindexPaths } from './pipeline.js';
 import { logger } from '../utils/logger.js';
 
@@ -12,6 +12,8 @@ interface WatchedCodebase {
   root_path: string;
   type: 'engine' | 'project';
   headers_only: number;
+  include_dirs?: string | null;
+  exclude_patterns?: string | null;
 }
 
 /**
@@ -27,6 +29,7 @@ export class CodebaseWatcher {
   constructor(
     readonly root: string,
     private readonly headersOnly: boolean,
+    private readonly scope?: CodebaseScope,
     private readonly onIndexed?: (summary: string) => void,
   ) {}
 
@@ -37,7 +40,7 @@ export class CodebaseWatcher {
       this.watcher = fs.watch(this.root, { recursive: true, persistent: true }, (_event, filename) => {
         if (!filename) return;
         const abs = path.join(this.root, filename.toString());
-        if (!isIndexablePath(this.root, abs, this.headersOnly)) return;
+        if (!isIndexablePath(this.root, abs, this.headersOnly, this.scope)) return;
         this.pending.add(abs);
         this.schedule();
       });
@@ -95,12 +98,12 @@ export class CodebaseWatcher {
 const watchers = new Map<string, CodebaseWatcher>();
 
 /** Start watching a codebase root (idempotent). */
-export function watchCodebase(root: string, headersOnly: boolean): CodebaseWatcher {
+export function watchCodebase(root: string, headersOnly: boolean, scope?: CodebaseScope): CodebaseWatcher {
   const key = path.resolve(root);
   let w = watchers.get(key);
   if (!w || !w.active) {
     w?.stop();
-    w = new CodebaseWatcher(key, headersOnly);
+    w = new CodebaseWatcher(key, headersOnly, scope);
     watchers.set(key, w);
     w.start();
   }
@@ -132,9 +135,9 @@ export function startWatchingAll(opts: { catchUp?: boolean } = {}): void {
       continue;
     }
     // Watch first so edits during the catch-up scan are not lost; they queue behind it on the index lock.
-    watchCodebase(cb.root_path, !!cb.headers_only);
+    watchCodebase(cb.root_path, !!cb.headers_only, scopeFromRow(cb));
     if (opts.catchUp !== false) {
-      indexCodebase(cb.root_path, cb.name, cb.type, !!cb.headers_only)
+      indexCodebase(cb.root_path, cb.name, cb.type, !!cb.headers_only, scopeFromRow(cb))
         .then(r => logger.info(`Catch-up ${cb.name}: ${r.newFiles} new, ${r.changedFiles} changed, ${r.deletedFiles} deleted`))
         .catch(err => logger.warn(`Catch-up of ${cb.name} failed: ${err}`));
     }

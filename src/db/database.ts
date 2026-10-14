@@ -46,6 +46,7 @@ function hasColumn(db: Database.Database, table: string, column: string): boolea
 /**
  * Upgrade databases created by older versions. Every step is idempotent so a fresh
  * database (already in the latest shape) passes through untouched.
+ *  v3: codebases.include_dirs / exclude_patterns (JSON arrays: sub-folder scope + extra excludes)
  *  v2: codebases.headers_only, references_table.symbol_id ON DELETE SET NULL
  *      (CASCADE used to wipe references held by *other* files when a symbol's file was re-indexed)
  */
@@ -56,6 +57,13 @@ function migrate(db: Database.Database): void {
   db.transaction(() => {
     if (!hasColumn(db, 'codebases', 'headers_only')) {
       db.exec(`ALTER TABLE codebases ADD COLUMN headers_only INTEGER NOT NULL DEFAULT 0`);
+    }
+
+    if (!hasColumn(db, 'codebases', 'include_dirs')) {
+      db.exec(`ALTER TABLE codebases ADD COLUMN include_dirs TEXT`);
+    }
+    if (!hasColumn(db, 'codebases', 'exclude_patterns')) {
+      db.exec(`ALTER TABLE codebases ADD COLUMN exclude_patterns TEXT`);
     }
 
     const fks = db.pragma('foreign_key_list(references_table)') as Array<{ from: string; on_delete: string }>;

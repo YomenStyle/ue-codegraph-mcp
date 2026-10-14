@@ -8,6 +8,7 @@ export interface PreparedQueries {
   getCodebaseById: Database.Statement;
   listCodebases: Database.Statement;
   updateCodebaseIndexedAt: Database.Statement;
+  updateCodebaseScope: Database.Statement;
 
   // Files
   insertFile: Database.Statement;
@@ -89,7 +90,8 @@ function prepareAll(db: Database.Database): PreparedQueries {
   return {
     // Codebases
     insertCodebase: db.prepare(
-      `INSERT INTO codebases (name, root_path, type, headers_only) VALUES (@name, @rootPath, @type, @headersOnly)`
+      `INSERT INTO codebases (name, root_path, type, headers_only, include_dirs, exclude_patterns)
+       VALUES (@name, @rootPath, @type, @headersOnly, @includeDirs, @excludePatterns)`
     ),
     getCodebaseByPath: db.prepare(
       `SELECT * FROM codebases WHERE root_path = @rootPath`
@@ -103,6 +105,9 @@ function prepareAll(db: Database.Database): PreparedQueries {
     updateCodebaseIndexedAt: db.prepare(
       `UPDATE codebases SET last_indexed_at = datetime('now') WHERE id = @id`
     ),
+    updateCodebaseScope: db.prepare(
+      `UPDATE codebases SET include_dirs = @includeDirs, exclude_patterns = @excludePatterns WHERE id = @id`
+    ),
 
     // Files
     insertFile: db.prepare(
@@ -110,7 +115,7 @@ function prepareAll(db: Database.Database): PreparedQueries {
        VALUES (@codebaseId, @relativePath, @absolutePath, @contentHash, @mtime, @fileSize)`
     ),
     getFileByPath: db.prepare(
-      `SELECT * FROM files WHERE absolute_path = @absolutePath`
+      `SELECT * FROM files WHERE codebase_id = @codebaseId AND absolute_path = @absolutePath`
     ),
     getFileById: db.prepare(
       `SELECT * FROM files WHERE id = @id`

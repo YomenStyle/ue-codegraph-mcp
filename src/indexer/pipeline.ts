@@ -3,7 +3,7 @@ import path from 'path';
 import { getDb, prep } from '../db/database.js';
 import { getQueries } from '../db/queries.js';
 import { getConfig } from '../config.js';
-import { discoverFiles, isIndexablePath, DiscoveredFile } from './file-discovery.js';
+import { discoverFiles, isIndexablePath, scopeFromRow, scopeToColumns, DiscoveredFile, CodebaseScope } from './file-discovery.js';
 import { ExtractedSymbol } from './symbol-extractor.js';
 import { detectChanges, computeFileHash } from './incremental.js';
 import { resolveLinks, emptyScope, ResolveScope } from './resolver.js';
@@ -37,6 +37,8 @@ interface CodebaseRow {
   root_path: string;
   type: 'engine' | 'project';
   headers_only: number;
+  include_dirs?: string | null;
+  exclude_patterns?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -60,8 +62,9 @@ export function indexCodebase(
   name: string,
   type: 'engine' | 'project',
   headersOnly = false,
+  scope?: CodebaseScope,
 ): Promise<IndexResult> {
-  return withIndexLock(() => runIndexCodebase(path.resolve(rootPath), name, type, headersOnly));
+  return withIndexLock(() => runIndexCodebase(path.resolve(rootPath), name, type, headersOnly, scope));
 }
 
 async function runIndexCodebase(
@@ -69,6 +72,7 @@ async function runIndexCodebase(
   name: string,
   type: 'engine' | 'project',
   headersOnly: boolean,
+  scope?: CodebaseScope,
 ): Promise<IndexResult> {
   const startTime = Date.now();
   const db = getDb();
@@ -76,15 +80,21 @@ async function runIndexCodebase(
 
   let codebase = queries.getCodebaseByPath.get({ rootPath }) as CodebaseRow | undefined;
   if (!codebase) {
-    queries.insertCodebase.run({ name, rootPath, type, headersOnly: headersOnly ? 1 : 0 });
+    queries.insertCodebase.run({ name, rootPath, type, headersOnly: headersOnly ? 1 : 0, ...scopeToColumns(scope) });
     codebase = queries.getCodebaseByPath.get({ rootPath }) as CodebaseRow;
-  } else if (!!codebase.headers_only !== headersOnly) {
-    prep('UPDATE codebases SET headers_only = ? WHERE id = ?').run(headersOnly ? 1 : 0, codebase.id);
+  } else {
+    if (!!codebase.headers_only !== headersOnly) {
+      prep('UPDATE codebases SET headers_only = ? WHERE id = ?').run(headersOnly ? 1 : 0, codebase.id);
+    }
+    // `scope` omitted = keep what is stored; given (even empty) = replace it. Files that fall out of scope are
+    // reported as deleted by the change detection below.
+    if (scope) queries.updateCodebaseScope.run({ id: codebase.id, ...scopeToColumns(scope) });
   }
   const codebaseId = codebase.id;
+  const effectiveScope: CodebaseScope = scope ?? scopeFromRow(codebase);
 
   if (headersOnly) logger.info('Headers-only mode: skipping .cpp/.cc/.cxx files');
-  const discoveredFiles = discoverFiles(rootPath, headersOnly);
+  const discoveredFiles = discoverFiles(rootPath, headersOnly, effectiveScope);
 
   const changes = detectChanges(codebaseId, discoveredFiles);
   logger.info(`Files: ${changes.newFiles.length} new, ${changes.changedFiles.length} changed, ${changes.unchangedFiles.length} unchanged, ${changes.deletedFileIds.length} deleted`);
@@ -155,7 +165,7 @@ async function applyChanges(
 
   const oldIncludes = new Map<number, Set<string>>();
   for (const f of toIndex) {
-    const row = queries.getFileByPath.get({ absolutePath: f.absolutePath }) as { id: number } | undefined;
+    const row = queries.getFileByPath.get({ codebaseId, absolutePath: f.absolutePath }) as { id: number } | undefined;
     if (!row) continue;
     for (const r of namesOf.all(row.id) as Array<{ name: string }>) scope.names.add(r.name);
     oldIncludes.set(row.id, new Set((includesOf.all(row.id) as Array<{ included_path: string }>).map(r => r.included_path)));
@@ -242,7 +252,7 @@ function storeParsed(
     try { contentHash = computeFileHash(file.absolutePath); } catch { contentHash = ''; }
   }
 
-  const existing = queries.getFileByPath.get({ absolutePath: file.absolutePath }) as { id: number } | undefined;
+  const existing = queries.getFileByPath.get({ codebaseId, absolutePath: file.absolutePath }) as { id: number } | undefined;
   let fileId: number;
   if (existing) {
     fileId = existing.id;
@@ -523,32 +533,36 @@ export function reindexPaths(paths: string[], opts: { force?: boolean } = {}): P
     const perCodebase = new Map<number, { toIndex: DiscoveredFile[]; deleted: number[] }>();
 
     for (const raw of new Set(paths.map(p => path.resolve(p)))) {
-      const cb = codebases.find(c => isInside(path.resolve(c.root_path), raw));
-      if (!cb) { outside++; continue; }
+      // Codebases may overlap (e.g. one for Source/, one for the whole project): update every one that holds the file.
+      const owners = codebases.filter(c => isInside(path.resolve(c.root_path), raw));
+      if (owners.length === 0) { outside++; continue; }
 
-      let bucket = perCodebase.get(cb.id);
-      if (!bucket) perCodebase.set(cb.id, (bucket = { toIndex: [], deleted: [] }));
-
-      const row = queries.getFileByPath.get({ absolutePath: raw }) as { id: number; content_hash: string | null } | undefined;
       let stat: fs.Stats | null = null;
       try { stat = fs.statSync(raw); } catch { /* gone */ }
 
-      if (stat?.isFile() && isIndexablePath(cb.root_path, raw, !!cb.headers_only)) {
-        if (row && !opts.force) {
-          let same = false;
-          try { same = computeFileHash(raw) === row.content_hash; } catch { /* unreadable: re-parse */ }
-          if (same) { summary.skipped++; continue; }
+      for (const cb of owners) {
+        let bucket = perCodebase.get(cb.id);
+        if (!bucket) perCodebase.set(cb.id, (bucket = { toIndex: [], deleted: [] }));
+
+        const row = queries.getFileByPath.get({ codebaseId: cb.id, absolutePath: raw }) as { id: number; content_hash: string | null } | undefined;
+
+        if (stat?.isFile() && isIndexablePath(cb.root_path, raw, !!cb.headers_only, scopeFromRow(cb))) {
+          if (row && !opts.force) {
+            let same = false;
+            try { same = computeFileHash(raw) === row.content_hash; } catch { /* unreadable: re-parse */ }
+            if (same) { summary.skipped++; continue; }
+          }
+          bucket.toIndex.push({
+            absolutePath: raw,
+            relativePath: path.relative(cb.root_path, raw),
+            mtime: stat.mtimeMs,
+            size: stat.size,
+          });
+        } else if (row) {
+          bucket.deleted.push(row.id);
+        } else {
+          summary.skipped++;
         }
-        bucket.toIndex.push({
-          absolutePath: raw,
-          relativePath: path.relative(cb.root_path, raw),
-          mtime: stat.mtimeMs,
-          size: stat.size,
-        });
-      } else if (row) {
-        bucket.deleted.push(row.id);
-      } else {
-        summary.skipped++;
       }
     }
 

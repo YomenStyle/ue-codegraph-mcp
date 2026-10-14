@@ -8,6 +8,7 @@ import { indexCodebase, reindexPaths } from './build/indexer/pipeline.js';
 import { shutdownParsePool } from './build/indexer/worker-pool.js';
 import { watchCodebase, startWatchingAll, stopAllWatchers } from './build/indexer/watcher.js';
 import { startViewer } from './build/viewer/server.js';
+import { scopeFromRow } from './build/indexer/file-discovery.js';
 import { findCallers, findCallees, findCallChain } from './build/graph/call-graph.js';
 import { getClassHierarchy } from './build/graph/inheritance-graph.js';
 import { getFileDependencies } from './build/graph/dependency-graph.js';
@@ -22,7 +23,8 @@ Usage:
   ue-graph <command> [arguments]
 
 Commands:
-  index <path> [name] [--headers-only]  코드베이스 인덱싱
+  index <path> [name] [--headers-only] [--include=A,B] [--exclude=P1,P2]
+                                코드베이스 인덱싱 (--include: path 아래 일부 폴더만, --exclude: 추가 제외 패턴)
   status                        인덱싱 상태 조회
   reindex <file_path...>        지정한 파일만 재인덱싱 (삭제된 파일은 제거)
   watch [path]                  파일 변경 감시: 저장하면 해당 파일만 자동 재인덱싱
@@ -74,9 +76,25 @@ async function main() {
         const name = positional[2] || path.split(/[\/]/).filter(Boolean).pop();
         const type = positional[3] === 'engine' ? 'engine' : 'project';
         const headersOnly = flags.includes('--headers-only');
+        const listFlag = (key) => {
+          const f = flags.find(a => a.startsWith(`--${key}=`));
+          return f === undefined ? undefined : f.slice(key.length + 3).split(',').map(s => s.trim()).filter(Boolean);
+        };
+        const includeDirs = listFlag('include');
+        const excludePatterns = listFlag('exclude');
+        let scope;
+        if (includeDirs !== undefined || excludePatterns !== undefined) {
+          const stored = getQueries().getCodebaseByPath.get({ rootPath: resolve(path) });
+          const prev = {};
+          for (const [col, key] of [['include_dirs', 'includeDirs'], ['exclude_patterns', 'excludePatterns']]) {
+            try { prev[key] = stored?.[col] ? JSON.parse(stored[col]) : undefined; } catch { /* ignore */ }
+          }
+          scope = { includeDirs: includeDirs ?? prev.includeDirs, excludePatterns: excludePatterns ?? prev.excludePatterns };
+          if (scope.includeDirs?.length) console.log(`Scope: only ${scope.includeDirs.join(', ')}`);
+        }
         if (headersOnly) console.log('Mode: headers-only (.h/.hpp/.inl only, .cpp skipped)');
         console.log(`Indexing ${path} as "${name}" (${type})...`);
-        const result = await indexCodebase(path, name, type, headersOnly);
+        const result = await indexCodebase(path, name, type, headersOnly, scope);
         console.log(`\nDone!`);
         console.log(`  Files: ${result.totalFiles} (new: ${result.newFiles}, changed: ${result.changedFiles})`);
         console.log(`  Symbols: ${result.totalSymbols}`);
@@ -101,6 +119,9 @@ async function main() {
           const macros = queries.countMacrosByCodebase.get({ codebaseId: cb.id });
           console.log(`[${cb.id}] ${cb.name} (${cb.type})`);
           console.log(`    Path: ${cb.root_path}`);
+          const sc = scopeFromRow(cb);
+          if (sc.includeDirs?.length) console.log(`    Only: ${sc.includeDirs.join(', ')}`);
+          if (sc.excludePatterns?.length) console.log(`    Extra excludes: ${sc.excludePatterns.join(', ')}`);
           console.log(`    Files: ${files.count} | Symbols: ${symbols.count} | Macros: ${macros.count}`);
           console.log(`    Last indexed: ${cb.last_indexed_at || 'Never'}`);
         }
@@ -148,7 +169,7 @@ async function main() {
         if (target) {
           const cb = getQueries().listCodebases.all().find(c => resolve(c.root_path) === resolve(target));
           if (!cb) { console.error('Not an indexed codebase. Run: ue-graph index <path> first'); process.exit(1); }
-          watchCodebase(cb.root_path, !!cb.headers_only);
+          watchCodebase(cb.root_path, !!cb.headers_only, scopeFromRow(cb));
           console.log(`Watching ${cb.root_path} (Ctrl+C to stop)`);
         } else {
           startWatchingAll();

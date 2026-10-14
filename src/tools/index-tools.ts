@@ -5,9 +5,18 @@ import { getDb } from '../db/database.js';
 import { getQueries } from '../db/queries.js';
 import { isEngineSource, isProjectDirectory } from '../ue/module-resolver.js';
 import { watchCodebase, listWatched } from '../indexer/watcher.js';
+import { scopeFromRow, CodebaseScope } from '../indexer/file-discovery.js';
 import { getConfig } from '../config.js';
 import path from 'path';
 import { startViewer } from '../viewer/server.js';
+
+function scopeLines(cb: Record<string, unknown>): string[] {
+  const s = scopeFromRow(cb as { include_dirs?: string | null; exclude_patterns?: string | null });
+  const out: string[] = [];
+  if (s.includeDirs?.length) out.push(`Only: ${s.includeDirs.join(', ')}`);
+  if (s.excludePatterns?.length) out.push(`Extra excludes: ${s.excludePatterns.join(', ')}`);
+  return out;
+}
 
 export function registerIndexTools(server: McpServer): void {
   server.tool(
@@ -18,8 +27,10 @@ export function registerIndexTools(server: McpServer): void {
       name: z.string().optional().describe('Name for this codebase (defaults to directory name)'),
       type: z.enum(['engine', 'project']).optional().describe('Codebase type (auto-detected if not specified)'),
       headers_only: z.boolean().optional().default(false).describe('Only index header files (.h/.hpp/.inl), skip .cpp files. Recommended for large engine source to reduce index size.'),
+      include_dirs: z.array(z.string()).optional().describe('Sub-folders of `path` to index, relative to it (e.g. ["Source","Plugins"]) so one codebase can span several folders and cross-links between them resolve. Omit to keep the stored setting (first run: whole path); pass [] to reset to the whole path.'),
+      exclude: z.array(z.string()).optional().describe('Extra exclude patterns on top of the defaults (ThirdParty, Intermediate, Binaries, Saved...), e.g. ["**/Tests/**"]. Omit to keep the stored setting; pass [] to clear.'),
     },
-    async ({ path: rootPath, name, type, headers_only }) => {
+    async ({ path: rootPath, name, type, headers_only, include_dirs, exclude }) => {
       try {
         // Auto-detect type if not specified
         let codebaseType: 'engine' | 'project' = type || 'project';
@@ -33,8 +44,22 @@ export function registerIndexTools(server: McpServer): void {
 
         const codebaseName = name || path.basename(path.resolve(rootPath)) || 'unnamed';
 
-        const result = await indexCodebase(rootPath, codebaseName, codebaseType, headers_only ?? false);
-        if (getConfig().watch) watchCodebase(rootPath, headers_only ?? false);
+        // Either list given => replace the stored scope (the one left out keeps its stored value); neither => keep.
+        let scope: CodebaseScope | undefined;
+        if (include_dirs !== undefined || exclude !== undefined) {
+          const stored = (getQueries().getCodebaseByPath.get({ rootPath: path.resolve(rootPath) }) as Record<string, string | null> | undefined);
+          const prev = stored ? scopeFromRow(stored) : {};
+          scope = {
+            includeDirs: include_dirs !== undefined ? include_dirs : prev.includeDirs,
+            excludePatterns: exclude !== undefined ? exclude : prev.excludePatterns,
+          };
+        }
+
+        const result = await indexCodebase(rootPath, codebaseName, codebaseType, headers_only ?? false, scope);
+        if (getConfig().watch) {
+          const row = getQueries().getCodebaseByPath.get({ rootPath: path.resolve(rootPath) }) as Record<string, string | null> | undefined;
+          watchCodebase(rootPath, headers_only ?? false, row ? scopeFromRow(row) : undefined);
+        }
 
         return {
           content: [{
@@ -82,6 +107,7 @@ export function registerIndexTools(server: McpServer): void {
                 `Codebase: ${codebase.name} (ID: ${codebase.id})`,
                 `Type: ${codebase.type}`,
                 `Path: ${codebase.root_path}`,
+                ...scopeLines(codebase),
                 `Last indexed: ${codebase.last_indexed_at || 'Never'}`,
                 `Files: ${fileCount}`,
                 `Symbols: ${symbolCount}`,
@@ -109,6 +135,7 @@ export function registerIndexTools(server: McpServer): void {
           const symbolCount = (queries.countSymbolsByCodebase.get({ codebaseId: cb.id }) as { count: number }).count;
           lines.push(`[${cb.id}] ${cb.name} (${cb.type})`);
           lines.push(`    Path: ${cb.root_path}`);
+          for (const l of scopeLines(cb)) lines.push(`    ${l}`);
           lines.push(`    Files: ${fileCount}, Symbols: ${symbolCount}`);
           lines.push(`    Last indexed: ${cb.last_indexed_at || 'Never'}\n`);
         }

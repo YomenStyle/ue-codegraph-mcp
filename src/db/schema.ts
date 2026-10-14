@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export const SCHEMA_DDL = `
 -- Registered codebases (engine or project)
@@ -9,7 +9,9 @@ CREATE TABLE IF NOT EXISTS codebases (
   type TEXT NOT NULL DEFAULT 'project' CHECK(type IN ('engine', 'project')),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   last_indexed_at TEXT,
-  headers_only INTEGER NOT NULL DEFAULT 0
+  headers_only INTEGER NOT NULL DEFAULT 0,
+  include_dirs TEXT,
+  exclude_patterns TEXT
 );
 
 -- Indexed files
