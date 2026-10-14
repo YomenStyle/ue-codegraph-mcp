@@ -26,6 +26,7 @@ for /f "tokens=1 delims=." %%a in ("%NODE_VER%") do set NODE_MAJOR=%%a
 set NODE_MAJOR=%NODE_MAJOR:v=%
 if "%NODE_MAJOR%"=="20" goto :node_ok
 if "%NODE_MAJOR%"=="22" goto :node_ok
+if "%NODE_MAJOR%"=="24" goto :node_ok
 
 echo.
 echo [ERROR] Node.js v%NODE_MAJOR% is NOT supported!

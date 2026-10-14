@@ -89,7 +89,7 @@ function prepareAll(db: Database.Database): PreparedQueries {
   return {
     // Codebases
     insertCodebase: db.prepare(
-      `INSERT INTO codebases (name, root_path, type) VALUES (@name, @rootPath, @type)`
+      `INSERT INTO codebases (name, root_path, type, headers_only) VALUES (@name, @rootPath, @type, @headersOnly)`
     ),
     getCodebaseByPath: db.prepare(
       `SELECT * FROM codebases WHERE root_path = @rootPath`

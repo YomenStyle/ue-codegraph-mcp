@@ -1,16 +1,16 @@
-import { getDb } from '../db/database.js';
+import fs from 'fs';
+import path from 'path';
+import { getDb, prep } from '../db/database.js';
 import { getQueries } from '../db/queries.js';
 import { getConfig } from '../config.js';
-import { discoverFiles, DiscoveredFile } from './file-discovery.js';
-import { parseFile } from './parser.js';
-import { extractSymbols, ExtractedSymbol } from './symbol-extractor.js';
-import { extractMacros } from './macro-extractor.js';
-import { extractCalls, extractIncludes, extractReferences } from './relationship-builder.js';
+import { discoverFiles, isIndexablePath, DiscoveredFile } from './file-discovery.js';
+import { ExtractedSymbol } from './symbol-extractor.js';
 import { detectChanges, computeFileHash } from './incremental.js';
-import { resolveIncludes } from './include-resolver.js';
+import { resolveLinks, emptyScope, ResolveScope } from './resolver.js';
+import { getParsePool } from './worker-pool.js';
+import type { ParsedFile } from './parse-task.js';
 import { ProgressTracker } from '../utils/progress.js';
 import { logger } from '../utils/logger.js';
-import fs from 'fs';
 
 export interface IndexResult {
   codebaseId: number;
@@ -24,91 +24,81 @@ export interface IndexResult {
   totalCalls: number;
   totalIncludes: number;
   elapsedMs: number;
+  /** 'full' = resolved every row (first index / big change), 'incremental' = only affected rows */
+  mode: 'full' | 'incremental';
+  relinkedFiles: number | 'all';
 }
 
-export async function indexCodebase(rootPath: string, name: string, type: 'engine' | 'project', headersOnly = false): Promise<IndexResult> {
+type Queries = ReturnType<typeof getQueries>;
+
+interface CodebaseRow {
+  id: number;
+  name: string;
+  root_path: string;
+  type: 'engine' | 'project';
+  headers_only: number;
+}
+
+// ---------------------------------------------------------------------------
+// Serialisation: CLI, MCP tools and the file watcher may all want to write at once.
+// ---------------------------------------------------------------------------
+
+let indexLock: Promise<unknown> = Promise.resolve();
+
+export function withIndexLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = indexLock.then(fn, fn);
+  indexLock = run.catch(() => undefined);
+  return run;
+}
+
+// ---------------------------------------------------------------------------
+// Full / incremental directory index
+// ---------------------------------------------------------------------------
+
+export function indexCodebase(
+  rootPath: string,
+  name: string,
+  type: 'engine' | 'project',
+  headersOnly = false,
+): Promise<IndexResult> {
+  return withIndexLock(() => runIndexCodebase(path.resolve(rootPath), name, type, headersOnly));
+}
+
+async function runIndexCodebase(
+  rootPath: string,
+  name: string,
+  type: 'engine' | 'project',
+  headersOnly: boolean,
+): Promise<IndexResult> {
   const startTime = Date.now();
   const db = getDb();
   const queries = getQueries();
-  const config = getConfig();
 
-  // Register or get codebase
-  let codebase = queries.getCodebaseByPath.get({ rootPath }) as { id: number } | undefined;
+  let codebase = queries.getCodebaseByPath.get({ rootPath }) as CodebaseRow | undefined;
   if (!codebase) {
-    queries.insertCodebase.run({ name, rootPath, type });
-    codebase = queries.getCodebaseByPath.get({ rootPath }) as { id: number };
+    queries.insertCodebase.run({ name, rootPath, type, headersOnly: headersOnly ? 1 : 0 });
+    codebase = queries.getCodebaseByPath.get({ rootPath }) as CodebaseRow;
+  } else if (!!codebase.headers_only !== headersOnly) {
+    prep('UPDATE codebases SET headers_only = ? WHERE id = ?').run(headersOnly ? 1 : 0, codebase.id);
   }
   const codebaseId = codebase.id;
 
-  // Discover files
   if (headersOnly) logger.info('Headers-only mode: skipping .cpp/.cc/.cxx files');
   const discoveredFiles = discoverFiles(rootPath, headersOnly);
 
-  // Detect changes (incremental)
   const changes = detectChanges(codebaseId, discoveredFiles);
-  const filesToIndex = [...changes.newFiles, ...changes.changedFiles];
-
   logger.info(`Files: ${changes.newFiles.length} new, ${changes.changedFiles.length} changed, ${changes.unchangedFiles.length} unchanged, ${changes.deletedFileIds.length} deleted`);
 
-  // Delete removed files
-  if (changes.deletedFileIds.length > 0) {
-    const deleteStmt = db.prepare(`DELETE FROM files WHERE id = ?`);
-    const deleteBatch = db.transaction((ids: number[]) => {
-      for (const id of ids) deleteStmt.run(id);
-    });
-    deleteBatch(changes.deletedFileIds);
-  }
+  const applied = await applyChanges(
+    codebaseId,
+    [...changes.newFiles, ...changes.changedFiles],
+    changes.deletedFileIds,
+    discoveredFiles.length,
+  );
 
-  let totalSymbols = 0;
-  let totalMacros = 0;
-  let totalCalls = 0;
-  let totalIncludes = 0;
-
-  // Process files in batches
-  const batchSize = config.batchSize;
-  const progress = new ProgressTracker('Indexing', filesToIndex.length);
-
-  for (let i = 0; i < filesToIndex.length; i += batchSize) {
-    const batch = filesToIndex.slice(i, i + batchSize);
-
-    const batchResult = db.transaction(() => {
-      let bSymbols = 0;
-      let bMacros = 0;
-      let bCalls = 0;
-      let bIncludes = 0;
-
-      for (const file of batch) {
-        const result = indexSingleFile(codebaseId, file, queries);
-        bSymbols += result.symbols;
-        bMacros += result.macros;
-        bCalls += result.calls;
-        bIncludes += result.includes;
-        progress.increment();
-      }
-
-      return { bSymbols, bMacros, bCalls, bIncludes };
-    })();
-
-    totalSymbols += batchResult.bSymbols;
-    totalMacros += batchResult.bMacros;
-    totalCalls += batchResult.bCalls;
-    totalIncludes += batchResult.bIncludes;
-  }
-
-  progress.finish();
-
-  // Resolution pass
-  logger.info('Running resolution pass...');
-  runResolutionPass(codebaseId);
-
-  // Resolve includes
-  resolveIncludes(codebaseId);
-
-  // Update codebase timestamp
   queries.updateCodebaseIndexedAt.run({ id: codebaseId });
-
   const elapsedMs = Date.now() - startTime;
-  logger.info(`Indexing complete in ${(elapsedMs / 1000).toFixed(1)}s`);
+  logger.info(`Indexing complete in ${(elapsedMs / 1000).toFixed(1)}s (${applied.mode})`);
 
   return {
     codebaseId,
@@ -117,12 +107,107 @@ export async function indexCodebase(rootPath: string, name: string, type: 'engin
     changedFiles: changes.changedFiles.length,
     unchangedFiles: changes.unchangedFiles.length,
     deletedFiles: changes.deletedFileIds.length,
-    totalSymbols,
-    totalMacros,
-    totalCalls,
-    totalIncludes,
+    totalSymbols: applied.symbols,
+    totalMacros: applied.macros,
+    totalCalls: applied.calls,
+    totalIncludes: applied.includes,
     elapsedMs,
+    mode: applied.mode,
+    relinkedFiles: applied.relinkedFiles,
   };
+}
+
+interface ApplyResult {
+  symbols: number;
+  macros: number;
+  calls: number;
+  includes: number;
+  mode: 'full' | 'incremental';
+  relinkedFiles: number | 'all';
+}
+
+/**
+ * Core of every indexing path: drop `deletedIds`, (re)parse `toIndex`, then link only what changed.
+ * Parsing runs on worker threads and overlaps with the DB writes of the previous batch.
+ */
+async function applyChanges(
+  codebaseId: number,
+  toIndex: DiscoveredFile[],
+  deletedIds: number[],
+  totalFiles?: number,
+): Promise<ApplyResult> {
+  const db = getDb();
+  const queries = getQueries();
+  const config = getConfig();
+  const out: ApplyResult = { symbols: 0, macros: 0, calls: 0, includes: 0, mode: 'incremental', relinkedFiles: 0 };
+
+  if (toIndex.length === 0 && deletedIds.length === 0) return out;
+
+  // --- 1. Snapshot what is about to be replaced (needed to know which links can go stale) ---
+  const scope = emptyScope();
+  const existingCount = (queries.countFilesByCodebase.get({ codebaseId }) as { count: number }).count;
+  const total = totalFiles ?? existingCount;
+
+  const namesOf = prep('SELECT DISTINCT name FROM symbols WHERE file_id = ?');
+  const includesOf = prep('SELECT included_path FROM includes WHERE file_id = ?');
+  const includersOf = prep('SELECT DISTINCT file_id FROM includes WHERE resolved_file_id = ?');
+  const pathOf = prep('SELECT relative_path FROM files WHERE id = ?');
+
+  const oldIncludes = new Map<number, Set<string>>();
+  for (const f of toIndex) {
+    const row = queries.getFileByPath.get({ absolutePath: f.absolutePath }) as { id: number } | undefined;
+    if (!row) continue;
+    for (const r of namesOf.all(row.id) as Array<{ name: string }>) scope.names.add(r.name);
+    oldIncludes.set(row.id, new Set((includesOf.all(row.id) as Array<{ included_path: string }>).map(r => r.included_path)));
+  }
+  for (const id of deletedIds) {
+    for (const r of namesOf.all(id) as Array<{ name: string }>) scope.names.add(r.name);
+    const rel = (pathOf.get(id) as { relative_path: string } | undefined)?.relative_path;
+    if (rel) scope.basenames.add(path.basename(rel));
+    for (const r of includersOf.all(id) as Array<{ file_id: number }>) scope.fileIds.add(r.file_id);
+  }
+
+  // --- 2. Remove deleted files ---
+  if (deletedIds.length > 0) {
+    const del = prep('DELETE FROM files WHERE id = ?');
+    db.transaction(() => { for (const id of deletedIds) del.run(id); })();
+  }
+
+  // --- 3. Parse (workers) + store (main thread), one batch ahead ---
+  const batchSize = config.batchSize;
+  const batches: DiscoveredFile[][] = [];
+  for (let i = 0; i < toIndex.length; i += batchSize) batches.push(toIndex.slice(i, i + batchSize));
+
+  const pool = getParsePool();
+  const parseBatch = (b: DiscoveredFile[]) => pool.parseAll(b.map(f => f.absolutePath));
+  const progress = new ProgressTracker('Indexing', toIndex.length);
+  let pending = batches.length > 0 ? parseBatch(batches[0]) : null;
+
+  for (let i = 0; i < batches.length; i++) {
+    const parsed = await pending!;
+    pending = i + 1 < batches.length ? parseBatch(batches[i + 1]) : null;
+
+    db.transaction(() => {
+      batches[i].forEach((file, k) => {
+        const r = storeParsed(codebaseId, file, parsed[k], queries, scope, oldIncludes);
+        out.symbols += r.symbols;
+        out.macros += r.macros;
+        out.calls += r.calls;
+        out.includes += r.includes;
+        progress.increment();
+      });
+    })();
+  }
+  progress.finish();
+
+  // --- 4. Link ---
+  const changedShare = (toIndex.length + deletedIds.length) / Math.max(total, 1);
+  const full = existingCount === 0 || changedShare > config.fullResolveRatio;
+  out.mode = full ? 'full' : 'incremental';
+  logger.info(`Running ${out.mode} resolution...`);
+  out.relinkedFiles = resolveLinks(codebaseId, full ? null : scope).relinkedFiles;
+
+  return out;
 }
 
 interface SingleFileResult {
@@ -132,68 +217,66 @@ interface SingleFileResult {
   includes: number;
 }
 
-function indexSingleFile(
+/** Remove everything derived from a file but keep the file row (and therefore its id, which others link to). */
+function clearFileData(db: ReturnType<typeof getDb>, fileId: number): void {
+  prep('DELETE FROM symbols WHERE file_id = ?').run(fileId);      // params, inheritance(child), nested symbols cascade
+  prep('DELETE FROM ue_macros WHERE file_id = ?').run(fileId);    // specifiers cascade
+  prep('DELETE FROM calls WHERE file_id = ?').run(fileId);
+  prep('DELETE FROM includes WHERE file_id = ?').run(fileId);
+  prep('DELETE FROM references_table WHERE file_id = ?').run(fileId);
+}
+
+function storeParsed(
   codebaseId: number,
   file: DiscoveredFile,
-  queries: ReturnType<typeof getQueries>,
+  parsed: ParsedFile,
+  queries: Queries,
+  scope: ResolveScope,
+  oldIncludes: Map<number, Set<string>>,
 ): SingleFileResult {
+  const db = getDb();
   const result: SingleFileResult = { symbols: 0, macros: 0, calls: 0, includes: 0 };
 
-  // Compute hash
-  const contentHash = computeFileHash(file.absolutePath);
-
-  // Check if file already exists (for re-indexing)
-  const existingFile = queries.getFileByPath.get({ absolutePath: file.absolutePath }) as { id: number } | undefined;
-  if (existingFile) {
-    // Delete old data (CASCADE will clean up symbols, macros, etc.)
-    queries.deleteFileData.run({ id: existingFile.id });
+  let contentHash = parsed.contentHash;
+  if (!contentHash) {
+    try { contentHash = computeFileHash(file.absolutePath); } catch { contentHash = ''; }
   }
 
-  // Insert/update file record
-  queries.insertFile.run({
-    codebaseId,
-    relativePath: file.relativePath,
-    absolutePath: file.absolutePath,
-    contentHash,
-    mtime: file.mtime,
-    fileSize: file.size,
-  });
+  const existing = queries.getFileByPath.get({ absolutePath: file.absolutePath }) as { id: number } | undefined;
+  let fileId: number;
+  if (existing) {
+    fileId = existing.id;
+    clearFileData(db, fileId);
+    queries.updateFileHash.run({ id: fileId, contentHash, mtime: file.mtime, fileSize: file.size });
+  } else {
+    const info = queries.insertFile.run({
+      codebaseId,
+      relativePath: file.relativePath,
+      absolutePath: file.absolutePath,
+      contentHash,
+      mtime: file.mtime,
+      fileSize: file.size,
+    });
+    fileId = Number(info.lastInsertRowid);
+    scope.basenames.add(path.basename(file.relativePath)); // others may have been waiting for this header
+  }
+  scope.fileIds.add(fileId);
 
-  const fileRecord = queries.getFileByPath.get({ absolutePath: file.absolutePath }) as { id: number };
-  const fileId = fileRecord.id;
+  if (!parsed.parsed) return result;
 
-  // Parse with tree-sitter
-  const parseResult = parseFile(file.absolutePath);
-  if (!parseResult) return result;
+  const symbolIdMap = new Map<string, number>(); // qualifiedName -> id
+  result.symbols = insertSymbols(fileId, parsed.symbols, null, symbolIdMap, queries);
+  result.macros = insertMacros(fileId, parsed.macros, symbolIdMap, parsed.symbols, queries);
+  result.calls = insertCalls(fileId, parsed.calls, symbolIdMap, queries);
+  result.includes = insertIncludes(fileId, parsed.includes, queries);
+  insertReferences(fileId, parsed.references, queries);
 
-  const { tree, source, originalSource } = parseResult;
+  for (const s of flattenSymbols(parsed.symbols)) scope.names.add(s.name);
 
-  try {
-    // Extract symbols from preprocessed source (AST)
-    const symbols = extractSymbols(tree, source);
-    const symbolIdMap = new Map<string, number>(); // qualifiedName -> id
-    result.symbols = insertSymbols(fileId, symbols, null, symbolIdMap, queries);
-
-    // Extract UE macros from original source (regex-based)
-    const macros = extractMacros(originalSource);
-    result.macros = insertMacros(fileId, macros, symbolIdMap, symbols, queries);
-
-    // Extract calls
-    const calls = extractCalls(tree, source, symbols);
-    result.calls = insertCalls(fileId, calls, symbolIdMap, queries);
-
-    // Extract includes from original source
-    const includes = extractIncludes(originalSource);
-    result.includes = insertIncludes(fileId, includes, queries);
-
-    // Extract references for known symbols in this file
-    const knownNames = new Set(symbols.map(s => s.name));
-    const refs = extractReferences(tree, source, knownNames);
-    insertReferences(fileId, refs, queries);
-
-  } finally {
-    // Release tree-sitter tree to free memory
-    (tree as any).delete?.();
+  const before = oldIncludes.get(fileId);
+  const after = new Set(parsed.includes.map(i => i.path));
+  if (!before || before.size !== after.size || [...after].some(p => !before.has(p))) {
+    scope.includeChangedFileIds.add(fileId);
   }
 
   return result;
@@ -234,6 +317,12 @@ function insertSymbols(
       symbolIdMap.set(sym.qualifiedName, symbolId);
     }
     symbolIdMap.set(sym.name, symbolId);
+    // A class and its constructor share a name and the line above overwrites the class with the
+    // constructor, so type symbols also get an unambiguous entry (used for UCLASS/USTRUCT/... macros).
+    if (['class', 'struct', 'enum', 'interface', 'union'].includes(sym.kind)) {
+      symbolIdMap.set(`type:${sym.name}`, symbolId);
+      if (sym.qualifiedName) symbolIdMap.set(`type:${sym.qualifiedName}`, symbolId);
+    }
 
     // Insert parameters
     for (const param of sym.parameters) {
@@ -302,7 +391,7 @@ function insertMacros(
       if (isMemberMacro && !['method', 'function', 'field', 'constructor', 'destructor', 'variable'].includes(sym.kind)) continue;
 
       const key = sym.qualifiedName || sym.name;
-      associatedSymbolId = symbolIdMap.get(key) || null;
+      associatedSymbolId = (isClassMacro ? symbolIdMap.get(`type:${key}`) : undefined) || symbolIdMap.get(key) || null;
       break;
     }
 
@@ -401,158 +490,88 @@ function flattenSymbols(symbols: ExtractedSymbol[]): ExtractedSymbol[] {
   return result;
 }
 
-/**
- * Resolution pass: link names to symbol IDs across files
- */
-function runResolutionPass(codebaseId: number): void {
-  const db = getDb();
 
-  // Resolve inheritance parent names to symbol IDs
-  const unresolvedInheritance = db.prepare(
-    `SELECT DISTINCT i.parent_name
-     FROM inheritance i
-     JOIN symbols s ON i.child_symbol_id = s.id
-     JOIN files f ON s.file_id = f.id
-     WHERE f.codebase_id = ? AND i.parent_symbol_id IS NULL`
-  ).all(codebaseId) as Array<{ parent_name: string }>;
+// ---------------------------------------------------------------------------
+// Targeted re-index (watcher, reindex_file tool, CLI)
+// ---------------------------------------------------------------------------
 
-  const findSymbolByName = db.prepare(
-    `SELECT s.id FROM symbols s JOIN files f ON s.file_id = f.id
-     WHERE s.name = ? AND f.codebase_id = ? AND s.kind IN ('class', 'struct', 'interface')
-     LIMIT 1`
-  );
-
-  const updateInheritance = db.prepare(
-    `UPDATE inheritance SET parent_symbol_id = ?
-     WHERE parent_name = ? AND parent_symbol_id IS NULL`
-  );
-
-  const resolveInhBatch = db.transaction(() => {
-    for (const { parent_name } of unresolvedInheritance) {
-      const sym = findSymbolByName.get(parent_name, codebaseId) as { id: number } | undefined;
-      if (sym) {
-        updateInheritance.run(sym.id, parent_name);
-      }
-    }
-  });
-  resolveInhBatch();
-
-  // Resolve call targets
-  const unresolvedCalls = db.prepare(
-    `SELECT DISTINCT c.callee_name
-     FROM calls c
-     JOIN files f ON c.file_id = f.id
-     WHERE f.codebase_id = ? AND c.callee_symbol_id IS NULL`
-  ).all(codebaseId) as Array<{ callee_name: string }>;
-
-  const findFuncByName = db.prepare(
-    `SELECT s.id FROM symbols s JOIN files f ON s.file_id = f.id
-     WHERE s.name = ? AND f.codebase_id = ?
-     AND s.kind IN ('function', 'method', 'constructor', 'destructor')
-     LIMIT 1`
-  );
-
-  const updateCall = db.prepare(
-    `UPDATE calls SET callee_symbol_id = ?
-     WHERE callee_name = ? AND callee_symbol_id IS NULL`
-  );
-
-  const resolveCallBatch = db.transaction(() => {
-    for (const { callee_name } of unresolvedCalls) {
-      const sym = findFuncByName.get(callee_name, codebaseId) as { id: number } | undefined;
-      if (sym) {
-        updateCall.run(sym.id, callee_name);
-      }
-    }
-  });
-  resolveCallBatch();
-
-  // Resolve references
-  const unresolvedRefs = db.prepare(
-    `SELECT DISTINCT r.symbol_name
-     FROM references_table r
-     JOIN files f ON r.file_id = f.id
-     WHERE f.codebase_id = ? AND r.symbol_id IS NULL`
-  ).all(codebaseId) as Array<{ symbol_name: string }>;
-
-  const updateRef = db.prepare(
-    `UPDATE references_table SET symbol_id = ?
-     WHERE symbol_name = ? AND symbol_id IS NULL`
-  );
-
-  const findAnySymbol = db.prepare(
-    `SELECT s.id FROM symbols s JOIN files f ON s.file_id = f.id
-     WHERE s.name = ? AND f.codebase_id = ?
-     LIMIT 1`
-  );
-
-  const resolveRefBatch = db.transaction(() => {
-    for (const { symbol_name } of unresolvedRefs) {
-      const sym = findAnySymbol.get(symbol_name, codebaseId) as { id: number } | undefined;
-      if (sym) {
-        updateRef.run(sym.id, symbol_name);
-      }
-    }
-  });
-  resolveRefBatch();
-
-  logger.info('Resolution pass completed');
+export interface ReindexSummary {
+  success: boolean;
+  message: string;
+  indexed: number;
+  deleted: number;
+  skipped: number;
 }
 
+const isInside = (root: string, file: string): boolean => {
+  const rel = path.relative(root, file);
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+};
+
 /**
- * Reindex a single file by path
+ * Bring the index in sync for specific paths: re-parse the ones whose content changed,
+ * drop the ones that no longer exist. Only affected links are re-resolved.
+ * `force` re-parses even when the content hash is unchanged.
  */
-export async function reindexSingleFile(absolutePath: string): Promise<{ success: boolean; message: string }> {
-  const db = getDb();
-  const queries = getQueries();
+export function reindexPaths(paths: string[], opts: { force?: boolean } = {}): Promise<ReindexSummary> {
+  return withIndexLock(async () => {
+    const queries = getQueries();
+    const codebases = queries.listCodebases.all() as CodebaseRow[];
+    const summary: ReindexSummary = { success: true, message: '', indexed: 0, deleted: 0, skipped: 0 };
+    let outside = 0;
 
-  // Find the file's codebase
-  const fileRecord = queries.getFileByPath.get({ absolutePath }) as { id: number; codebase_id: number } | undefined;
+    const perCodebase = new Map<number, { toIndex: DiscoveredFile[]; deleted: number[] }>();
 
-  if (!fileRecord) {
-    // Try to find which codebase this file belongs to
-    const codebases = queries.listCodebases.all() as Array<{ id: number; root_path: string }>;
-    let codebaseId: number | null = null;
-    for (const cb of codebases) {
-      if (absolutePath.startsWith(cb.root_path)) {
-        codebaseId = cb.id;
-        break;
+    for (const raw of new Set(paths.map(p => path.resolve(p)))) {
+      const cb = codebases.find(c => isInside(path.resolve(c.root_path), raw));
+      if (!cb) { outside++; continue; }
+
+      let bucket = perCodebase.get(cb.id);
+      if (!bucket) perCodebase.set(cb.id, (bucket = { toIndex: [], deleted: [] }));
+
+      const row = queries.getFileByPath.get({ absolutePath: raw }) as { id: number; content_hash: string | null } | undefined;
+      let stat: fs.Stats | null = null;
+      try { stat = fs.statSync(raw); } catch { /* gone */ }
+
+      if (stat?.isFile() && isIndexablePath(cb.root_path, raw, !!cb.headers_only)) {
+        if (row && !opts.force) {
+          let same = false;
+          try { same = computeFileHash(raw) === row.content_hash; } catch { /* unreadable: re-parse */ }
+          if (same) { summary.skipped++; continue; }
+        }
+        bucket.toIndex.push({
+          absolutePath: raw,
+          relativePath: path.relative(cb.root_path, raw),
+          mtime: stat.mtimeMs,
+          size: stat.size,
+        });
+      } else if (row) {
+        bucket.deleted.push(row.id);
+      } else {
+        summary.skipped++;
       }
     }
-    if (!codebaseId) {
-      return { success: false, message: 'File does not belong to any indexed codebase' };
+
+    for (const [codebaseId, { toIndex, deleted }] of perCodebase) {
+      await applyChanges(codebaseId, toIndex, deleted);
+      queries.updateCodebaseIndexedAt.run({ id: codebaseId });
+      summary.indexed += toIndex.length;
+      summary.deleted += deleted.length;
     }
 
-    // New file
-    const stat = fs.statSync(absolutePath);
-    const file: DiscoveredFile = {
-      absolutePath,
-      relativePath: absolutePath.substring(absolutePath.indexOf(absolutePath) + 1),
-      mtime: stat.mtimeMs,
-      size: stat.size,
-    };
+    if (outside > 0 && summary.indexed + summary.deleted + summary.skipped === 0) {
+      summary.success = false;
+      summary.message = 'File does not belong to any indexed codebase';
+    } else {
+      summary.message = `Re-indexed ${summary.indexed}, removed ${summary.deleted}, unchanged/ignored ${summary.skipped}` +
+        (outside ? `, outside any codebase ${outside}` : '');
+    }
+    return summary;
+  });
+}
 
-    db.transaction(() => {
-      indexSingleFile(codebaseId!, file, queries);
-    })();
-
-    return { success: true, message: 'File indexed for the first time' };
-  }
-
-  // Re-index existing file
-  const stat = fs.statSync(absolutePath);
-  const codebase = queries.getCodebaseById.get({ id: fileRecord.codebase_id }) as { root_path: string };
-
-  const file: DiscoveredFile = {
-    absolutePath,
-    relativePath: absolutePath.replace(codebase.root_path + '/', ''),
-    mtime: stat.mtimeMs,
-    size: stat.size,
-  };
-
-  db.transaction(() => {
-    indexSingleFile(fileRecord.codebase_id, file, queries);
-  })();
-
-  return { success: true, message: 'File re-indexed successfully' };
+/** Single-file convenience wrapper kept for the MCP tool and CLI. Always re-parses. */
+export async function reindexSingleFile(absolutePath: string): Promise<{ success: boolean; message: string }> {
+  const r = await reindexPaths([absolutePath], { force: true });
+  return { success: r.success, message: r.message };
 }

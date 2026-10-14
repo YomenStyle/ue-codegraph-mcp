@@ -4,6 +4,10 @@ import { indexCodebase, reindexSingleFile, IndexResult } from '../indexer/pipeli
 import { getDb } from '../db/database.js';
 import { getQueries } from '../db/queries.js';
 import { isEngineSource, isProjectDirectory } from '../ue/module-resolver.js';
+import { watchCodebase, listWatched } from '../indexer/watcher.js';
+import { getConfig } from '../config.js';
+import path from 'path';
+import { startViewer } from '../viewer/server.js';
 
 export function registerIndexTools(server: McpServer): void {
   server.tool(
@@ -27,9 +31,10 @@ export function registerIndexTools(server: McpServer): void {
           }
         }
 
-        const codebaseName = name || rootPath.split('/').pop() || 'unnamed';
+        const codebaseName = name || path.basename(path.resolve(rootPath)) || 'unnamed';
 
         const result = await indexCodebase(rootPath, codebaseName, codebaseType, headers_only ?? false);
+        if (getConfig().watch) watchCodebase(rootPath, headers_only ?? false);
 
         return {
           content: [{
@@ -81,6 +86,7 @@ export function registerIndexTools(server: McpServer): void {
                 `Files: ${fileCount}`,
                 `Symbols: ${symbolCount}`,
                 `UE Macros: ${macroCount}`,
+                `Watching: ${listWatched().includes(path.resolve(codebase.root_path as string)) ? 'yes (auto re-index on save)' : 'no'}`,
               ].join('\n'),
             }],
           };
@@ -118,8 +124,27 @@ export function registerIndexTools(server: McpServer): void {
   );
 
   server.tool(
+    'open_viewer',
+    'Start the local web viewer (class hierarchy, call graph, include graph, module map, index health) and return its URL. Tell the user to open the URL in a browser. The page refreshes by itself when the index changes.',
+    {
+      port: z.number().optional().describe('Preferred port (default 4177; next free port is used if taken)'),
+    },
+    async ({ port }) => {
+      try {
+        const viewer = await startViewer(port ?? 4177);
+        return { content: [{ type: 'text' as const, text: `UE CodeGraph viewer is running: ${viewer.url}` }] };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `Error starting viewer: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
     'reindex_file',
-    'Re-index a single file (useful after file changes).',
+    'Re-index specific files (normally unnecessary: changed files are picked up automatically by the file watcher). Deleted files are removed from the index. Only affected links are re-resolved.',
     {
       file_path: z.string().describe('Absolute path to the file to re-index'),
     },
@@ -156,6 +181,7 @@ function formatIndexResult(result: IndexResult): string {
     `UE macros found: ${result.totalMacros}`,
     `Call relationships: ${result.totalCalls}`,
     `Include directives: ${result.totalIncludes}`,
+    `Resolution: ${result.mode}${result.mode === 'incremental' ? ` (${result.relinkedFiles} files relinked)` : ''}`,
     `Time: ${(result.elapsedMs / 1000).toFixed(1)}s`,
   ].join('\n');
 }

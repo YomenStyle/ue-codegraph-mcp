@@ -10,7 +10,7 @@ import { logger } from './utils/logger.js';
 export function createServer(): McpServer {
   const server = new McpServer({
     name: 'ue-codegraph',
-    version: '1.0.0',
+    version: '1.1.0',
   });
 
   // Register all tool groups
@@ -21,7 +21,7 @@ export function createServer(): McpServer {
   registerBlueprintTools(server);
   registerSearchTools(server);
 
-  logger.info('All 15 MCP tools registered');
+  logger.info('All 17 MCP tools registered');
 
   return server;
 }

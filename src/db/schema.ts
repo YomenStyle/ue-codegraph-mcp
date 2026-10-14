@@ -1,3 +1,5 @@
+export const SCHEMA_VERSION = 2;
+
 export const SCHEMA_DDL = `
 -- Registered codebases (engine or project)
 CREATE TABLE IF NOT EXISTS codebases (
@@ -6,7 +8,8 @@ CREATE TABLE IF NOT EXISTS codebases (
   root_path TEXT NOT NULL UNIQUE,
   type TEXT NOT NULL DEFAULT 'project' CHECK(type IN ('engine', 'project')),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  last_indexed_at TEXT
+  last_indexed_at TEXT,
+  headers_only INTEGER NOT NULL DEFAULT 0
 );
 
 -- Indexed files
@@ -124,6 +127,7 @@ CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_calls_callee_name ON calls(callee_name);
 CREATE INDEX IF NOT EXISTS idx_calls_caller_name ON calls(caller_name);
+CREATE INDEX IF NOT EXISTS idx_calls_file ON calls(file_id, callee_name);
 
 -- Include dependencies
 CREATE TABLE IF NOT EXISTS includes (
@@ -141,7 +145,7 @@ CREATE INDEX IF NOT EXISTS idx_inc_path ON includes(included_path);
 -- Symbol cross-references
 CREATE TABLE IF NOT EXISTS references_table (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  symbol_id INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
+  symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
   file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   symbol_name TEXT NOT NULL,
   line_number INTEGER,

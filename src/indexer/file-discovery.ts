@@ -12,21 +12,35 @@ export interface DiscoveredFile {
 
 const HEADER_EXTENSIONS = new Set(['.h', '.hpp', '.inl']);
 
+function isExcluded(rootPath: string, filePath: string): boolean {
+  const rel = path.relative(rootPath, filePath);
+  for (const pattern of getConfig().excludePatterns) {
+    const cleaned = pattern.replace(/\*\*\//g, '');
+    const needle = cleaned.replace(/\*\*/g, '');
+    // patterns are written with '/', relative paths use the OS separator
+    if (rel.includes(needle) || rel.includes(needle.replace(/\//g, path.sep))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** True when `filePath` (inside `rootPath`) is a source file the indexer would pick up. */
+export function isIndexablePath(rootPath: string, filePath: string, headersOnly = false): boolean {
+  const rel = path.relative(rootPath, filePath);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return false;
+  if (rel.split(path.sep).some(seg => seg.startsWith('.') && seg.length > 1)) return false;
+  const ext = path.extname(filePath).toLowerCase();
+  const extensions = headersOnly ? HEADER_EXTENSIONS : new Set(getConfig().fileExtensions);
+  if (!extensions.has(ext)) return false;
+  return !isExcluded(rootPath, filePath);
+}
+
 export function discoverFiles(rootPath: string, headersOnly = false): DiscoveredFile[] {
   const config = getConfig();
   const results: DiscoveredFile[] = [];
   const extensions = headersOnly ? HEADER_EXTENSIONS : new Set(config.fileExtensions);
-
-  function shouldExclude(filePath: string): boolean {
-    const rel = path.relative(rootPath, filePath);
-    for (const pattern of config.excludePatterns) {
-      const cleaned = pattern.replace(/\*\*\//g, '');
-      if (rel.includes(cleaned.replace(/\*\*/g, ''))) {
-        return true;
-      }
-    }
-    return false;
-  }
+  const shouldExclude = (filePath: string) => isExcluded(rootPath, filePath);
 
   function walk(dir: string): void {
     let entries: fs.Dirent[];

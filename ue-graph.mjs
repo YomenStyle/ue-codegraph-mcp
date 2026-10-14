@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 
+import { spawn } from 'child_process';
+import { resolve } from 'path';
 import { createServer } from './build/server.js';
 import { getDb, closeDb } from './build/db/database.js';
-import { indexCodebase, reindexSingleFile } from './build/indexer/pipeline.js';
+import { indexCodebase, reindexPaths } from './build/indexer/pipeline.js';
+import { shutdownParsePool } from './build/indexer/worker-pool.js';
+import { watchCodebase, startWatchingAll, stopAllWatchers } from './build/indexer/watcher.js';
+import { startViewer } from './build/viewer/server.js';
 import { findCallers, findCallees, findCallChain } from './build/graph/call-graph.js';
 import { getClassHierarchy } from './build/graph/inheritance-graph.js';
 import { getFileDependencies } from './build/graph/dependency-graph.js';
@@ -19,7 +24,9 @@ Usage:
 Commands:
   index <path> [name] [--headers-only]  코드베이스 인덱싱
   status                        인덱싱 상태 조회
-  reindex <file_path>           단일 파일 재인덱싱
+  reindex <file_path...>        지정한 파일만 재인덱싱 (삭제된 파일은 제거)
+  watch [path]                  파일 변경 감시: 저장하면 해당 파일만 자동 재인덱싱
+  ui [--port N] [--no-open]     인덱스를 브라우저에서 시각화 (기본 http://localhost:4177)
   delete <id|name|all>          코드베이스 삭제
 
   analyze <class_name>          클래스 상세 분석
@@ -64,7 +71,7 @@ async function main() {
         if (!path) { console.error('Error: path required\nUsage: ue-graph index <path> [name] [--headers-only]'); process.exit(1); }
         const flags = args.filter(a => a.startsWith('--'));
         const positional = args.filter(a => !a.startsWith('--'));
-        const name = positional[2] || path.split('/').pop();
+        const name = positional[2] || path.split(/[\/]/).filter(Boolean).pop();
         const type = positional[3] === 'engine' ? 'engine' : 'project';
         const headersOnly = flags.includes('--headers-only');
         if (headersOnly) console.log('Mode: headers-only (.h/.hpp/.inl only, .cpp skipped)');
@@ -76,6 +83,7 @@ async function main() {
         console.log(`  UE Macros: ${result.totalMacros}`);
         console.log(`  Calls: ${result.totalCalls}`);
         console.log(`  Includes: ${result.totalIncludes}`);
+        console.log(`  Resolution: ${result.mode}${result.mode === 'incremental' ? ` (${result.relinkedFiles} files relinked)` : ''}`);
         console.log(`  Time: ${(result.elapsedMs / 1000).toFixed(1)}s`);
         break;
       }
@@ -126,10 +134,38 @@ async function main() {
       }
 
       case 'reindex': {
-        const filePath = args[1];
-        if (!filePath) { console.error('Usage: ue-graph reindex <file_path>'); process.exit(1); }
-        const result = await reindexSingleFile(filePath);
+        const files = args.slice(1).filter(a => !a.startsWith('--'));
+        if (files.length === 0) { console.error('Usage: ue-graph reindex <file_path...>'); process.exit(1); }
+        const result = await reindexPaths(files, { force: true });
         console.log(result.message);
+        if (!result.success) process.exitCode = 1;
+        break;
+      }
+
+      case 'watch': {
+        keepAlive = true;
+        const target = args[1] && !args[1].startsWith('--') ? args[1] : null;
+        if (target) {
+          const cb = getQueries().listCodebases.all().find(c => resolve(c.root_path) === resolve(target));
+          if (!cb) { console.error('Not an indexed codebase. Run: ue-graph index <path> first'); process.exit(1); }
+          watchCodebase(cb.root_path, !!cb.headers_only);
+          console.log(`Watching ${cb.root_path} (Ctrl+C to stop)`);
+        } else {
+          startWatchingAll();
+          console.log('Watching all indexed codebases (Ctrl+C to stop)');
+        }
+        await new Promise(() => {});
+        break;
+      }
+
+      case 'ui': case 'viewer': {
+        keepAlive = true;
+        const pi = args.indexOf('--port');
+        const port = pi >= 0 ? parseInt(args[pi + 1]) : 4177;
+        const viewer = await startViewer(port);
+        console.log(`UE CodeGraph viewer: ${viewer.url}  (Ctrl+C to stop)`);
+        if (!args.includes('--no-open')) openBrowser(viewer.url);
+        await new Promise(() => {});
         break;
       }
 
@@ -337,8 +373,28 @@ async function main() {
     console.error(`Error: ${err.message || err}`);
     process.exit(1);
   } finally {
-    closeDb();
+    if (!keepAlive) {
+      await shutdownParsePool();
+      closeDb();
+    }
   }
 }
 
-main();
+let keepAlive = false;
+
+function openBrowser(url) {
+  const cmd = process.platform === 'win32' ? ['cmd', ['/c', 'start', '', url]]
+    : process.platform === 'darwin' ? ['open', [url]] : ['xdg-open', [url]];
+  try { spawn(cmd[0], cmd[1], { stdio: 'ignore', detached: true }).unref(); } catch { /* the URL is printed anyway */ }
+}
+
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, async () => {
+    stopAllWatchers();
+    await shutdownParsePool();
+    closeDb();
+    process.exit(0);
+  });
+}
+
+main().then(() => { if (!keepAlive) process.exit(process.exitCode ?? 0); });

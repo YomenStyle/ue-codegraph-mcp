@@ -2,7 +2,7 @@
 
 **MCP server for indexing and querying Unreal Engine C++ codebases.**
 
-Indexes your UE project's `Source/` directory into a local SQLite database and exposes 15 MCP tools so Claude Code can answer questions about call graphs, class structure, `#include` dependencies, and Blueprint-exposed symbols — without reading raw files every time.
+Indexes your UE project's `Source/` directory into a local SQLite database and exposes 17 MCP tools so Claude Code can answer questions about call graphs, class structure, `#include` dependencies, and Blueprint-exposed symbols — without reading raw files every time.
 
 ---
 
@@ -26,7 +26,7 @@ Indexes your UE project's `Source/` directory into a local SQLite database and e
 | npm | 9+ | `npm --version` |
 | Claude Code | latest | `claude --version` |
 
-> **Node.js 22 LTS is required.** Odd-numbered "Current" releases (v23, v25, etc.) are incompatible with tree-sitter's native bindings and will fail to parse files.
+> **Use an even-numbered Node.js release (20, 22 LTS or 24).** Odd-numbered "Current" releases (v23, v25, etc.) are incompatible with tree-sitter's native bindings and will fail to parse files. Node 24 needs `better-sqlite3` 12+ (this repo ships 13); the older 11.x crashes the process under garbage collection on Node 24.
 
 ---
 
@@ -108,7 +108,9 @@ Use `ue-graph` directly from the terminal without Claude Code.
 ```powershell
 ue-graph index <path> [name]     # Index a codebase
 ue-graph status                  # Show indexed codebases and stats
-ue-graph reindex <file_path>     # Re-index a single file after changes
+ue-graph reindex <file...>       # Re-index specific files (deleted files are removed)
+ue-graph watch [path]            # Watch for edits and re-index changed files automatically
+ue-graph ui [--port N]           # Open the visual explorer in your browser
 ue-graph delete <id|name|all>    # Remove a codebase from the index
 ```
 
@@ -146,13 +148,60 @@ ue-graph deps "G:\...\MyActor.h"            # #include dependency graph
 
 ---
 
+## Incremental indexing
+
+Edits are applied in proportion to what changed, not to the size of the codebase.
+
+- **Change detection** compares size, mtime and content hash, so only touched files are parsed.
+- **File watcher**: while the MCP server runs (or `ue-graph watch`), saving a `.h`/`.cpp` re-indexes just that file
+  (debounced). On start-up the server also catches up on edits made while it was off.
+  Disable with `UE_CODEGRAPH_WATCH=0`.
+- **Scoped linking**: after a re-parse only the affected rows are re-linked: the file's own calls, references,
+  base classes and includes, plus unresolved rows elsewhere that point at a symbol name that was re-created.
+  Files keep their row id on re-index, so `#include` links from other files stay valid.
+- **Include-aware resolution**: when several symbols share a name (`Tick`, `BeginPlay`...), a call resolves to
+  the one in the same file, then the paired header, then the include closure (3 hops), instead of an arbitrary match.
+  If a file's `#include` list changes, the files that include it (2 hops) are re-ranked.
+- **Parallel parsing**: large batches are parsed on worker threads (`UE_CODEGRAPH_WORKERS=N`, `0` = single thread)
+  while the main thread writes the previous batch to SQLite.
+- When more than 30% of files changed (or on the first index) a full link pass runs instead.
+
+Parsing is file-local, so a header edit does **not** require re-parsing its includers. Their links are refreshed
+instead, which is what the scoped linking above does.
+
+Rough numbers on a synthetic 3000-header project: full index 17 s single-threaded, 5.5 s with 6 workers;
+re-indexing one saved file takes about 50 ms.
+
+## Visual explorer
+
+```powershell
+ue-graph ui            # http://localhost:4177
+```
+
+or ask Claude to call the `open_viewer` tool. Everything runs locally (bound to 127.0.0.1) and the page refreshes by
+itself when the index changes.
+
+| Tab | Shows |
+|---|---|
+| Overview | Counts, link quality, symbols by kind, UE macros, biggest classes, most-called functions, most-included headers |
+| Class hierarchy | Ancestors and descendants of a class (engine/unindexed bases appear as dashed nodes) |
+| Call graph | Callers and callees of a function, up to 4 levels |
+| Includes | `#include` neighbourhood of a file in both directions |
+| Modules | Folder-level dependency map (aggregated `#include` counts) |
+
+Click a node for details (members, UE macros, signature, includes), double-click to re-center, drag to rearrange,
+scroll to zoom. Purple dot = carries a UE macro (`UCLASS`...), green dot = Blueprint-exposed.
+
+---
+
 ## MCP Tools Reference
 
 | Tool | Description |
 |---|---|
 | `init_codebase` | Index a UE source directory |
 | `get_index_status` | Show registered codebases and stats |
-| `reindex_file` | Re-index a single file |
+| `reindex_file` | Re-index specific files (normally automatic, see below) |
+| `open_viewer` | Start the local web viewer and return its URL |
 | `find_callers` | Find all callers of a function |
 | `find_callees` | Find all functions called by a function |
 | `find_call_chain` | Shortest call path from function A to B |
@@ -175,7 +224,8 @@ ue-graph deps "G:\...\MyActor.h"            # #include dependency graph
 |---|---|
 | `analyze_class` may fail on 3000+ line headers (forward declarations) | Use Grep + Read instead |
 | Parent class lookup broken when `GENERATED_BODY()` is the only inheritance hint | Use `grep 'class Foo.*public'` |
-| `find_callees` can mix results when multiple classes share the same method name | Use unique function names or `find_callers` |
+| `find_callees` can mix results when multiple classes share the same method name | Calls are ranked by include closure, but without type information it can still pick the wrong overload |
+| Databases indexed before the scoped-linking release attach `UCLASS`/`USTRUCT` to the class constructor | Delete the codebase and index it once more (`ue-graph delete <name>`) |
 
 ---
 
